@@ -1,0 +1,470 @@
+---
+title: "Projekt"
+output:
+  html_document: default
+  pdf_document: default
+date: "2026-01-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Anmerkung: Für die Abgabe wurde die API und der Dateipfad durch Platzhalter ersetzt.
+
+
+Laden der benötigten Pakete
+
+Zunächst werden die notwendigen Pakete für die Datenverarbeitung (tidyverse, stringr), das maschinelle Lernen (caret, lattice) sowie die Verarbeitung von JSON-Daten (jsonlite) geladen. Zusätzlich werden die Pakete mall und ellmer eingebunden, um die Schnittstelle zu Large Language Models (LLMs) zu bedienen.
+
+```{r Pakete laden}
+
+library(tidyverse)
+library(stringr)
+library(caret)
+library(lattice)
+library(jsonlite)
+library(mall)
+library(ellmer)
+
+```
+
+
+Import der Rohtexte
+
+In diesem Schritt werden alle Textdateien aus dem lokalen Projektverzeichnis eingelesen. Mithilfe einer Hilfsfunktion wird jede Datei einzeln geladen und zusammen mit ihrem Dateinamen in einem strukturierten Tibble gespeichert. Zudem wird eine Platzhalterspalte für den Gerichtstyp initialisiert.
+
+```{r Dateien laden und einlesen}
+
+pfad = "mein Pfad"
+
+dateien = list.files(path = pfad, pattern = "\\.txt$", full.names = TRUE)
+
+lies_urteile = function(pfad) {
+  tibble(
+    dateiname = basename(pfad), 
+    text = read_file(pfad) 
+  )
+}
+
+urteile = dateien %>% 
+  map_dfr(lies_urteile)
+
+urteile = urteile %>%
+  mutate(
+    gerichtstyp = NA_character_, 
+  )
+```
+
+
+Filterung nach Landgerichtsurteilen
+
+Da die Analyse auf Urteile der ersten Instanz fokussiert ist, werden die Dokumente mittels regulärer Ausdrücke gefiltert. Es werden nur Texte beibehalten, die eine Zuständigkeit der Landgerichte (LG) ausweisen, während Urteile der Oberlandesgerichte (OLG) ausgeschlossen werden.
+```{r Vorfiltern nach LG}
+
+urteile_LG = urteile %>%
+ 
+  filter(str_detect(text, "Gerichtsbarkeit\\s*LG")) %>%
+  filter(!str_detect(text, "Gerichtsbarkeit\\s*OLG"))
+
+ nrow(urteile_LG)
+```
+
+
+Extraktion von Tenor und Tatbestand
+
+Um die relevanten juristischen Informationen gezielt analysieren zu können, werden die Abschnitte "Tenor" und "Tatbestand" mithilfe von Regex-Matching aus dem Volltext extrahiert. Diese Segmentierung ist essenziell für die spätere Klassifizierung des Urteilsausgangs und der Sachverhaltsmerkmale.
+```{r Tenor und Tatbestand extrahieren }
+
+LG_tenor_tatbestand = urteile_LG %>%
+  mutate(
+    tenor_extrakt = str_match(text, "(?si)Tenor\\s+(.*?)(?=(?:\\r?\\n|\\s{3,})Tatbestand(?:\\r?\\n|\\s{3,}))")[,2],
+    tatbestand_extrakt = str_match(text, "(?si)(?:\\r?\\n|\\s{3,})Tatbestand(?:\\r?\\n|\\s{3,})(.*?)(?=(?:\\r?\\n|\\s{3,})(?:Entscheidungs)?gründe\\b)")[,2]
+  )
+```
+
+
+Identifikation unvollständiger Segmente
+
+Hier wird geprüft, in welchen Dokumenten die Extraktion der Textsegmente fehlgeschlagen ist. 
+```{r Fehlende Werte betrachten }
+
+probleme <- LG_tenor_tatbestand %>%
+  filter(is.na(tenor_extrakt) | is.na(tatbestand_extrakt))
+
+View(probleme)
+
+```
+
+
+Bereinigung des Datensatzes
+
+Dokumente, in denen kein Tenor oder kein Tatbestand erfolgreich extrahiert werden konnte, werden aus dem Datensatz entfernt.
+```{r Datensatz bereinigen }
+
+LG_bereinigt = LG_tenor_tatbestand %>%
+  drop_na(tenor_extrakt, tatbestand_extrakt)
+
+```
+
+
+Segmentierung für die Batch-Verarbeitung
+
+Um die API-Anfragen effizient zu verwalten und Ratenbegrenzungen zu berücksichtigen, wird der bereinigte Datensatz in drei etwa gleich große Blöcke unterteilt.
+```{r Datensatz in 3 Teile teilen }
+
+anzahl_urteile = nrow(LG_bereinigt)
+block_groesse = ceiling(anzahl_urteile / 3)
+
+urteile_1 = LG_bereinigt[1:block_groesse, ]
+urteile_2 = LG_bereinigt[(block_groesse + 1):(2 * block_groesse), ]
+urteile_3 = LG_bereinigt[(2 * block_groesse + 1):anzahl_urteile, ]
+
+message(paste("Teil 1:", nrow(urteile_1), "Urteile"))
+message(paste("Teil 2:", nrow(urteile_2), "Urteile"))
+message(paste("Teil 3:", nrow(urteile_3), "Urteile"))
+
+```
+
+
+Definition des Prompts 
+
+Es wird ein detaillierter Instruktions-Prompt definiert, der das LLM anweist, den Tenor auf Schadensersatzsummen, Klageabweisungen oder sonstige Verfahrensausgänge zu prüfen.
+```{r Prompt zur Extraktion des Urteilsausgangs }
+
+mein_prompt = "Lies den Text und analysiere folgende Aspekte: 
+**Geldbetrag oder Abweisung**: Überprüfe, ob ein Geldbetrag genannt wird, den der Kläger als Schadensersatz erhält, oder ob die Klage abgewiesen wurde. Der Betrag wird in der Regel in Euro ohne Zinsen angegeben (z. B. 25.900 EUR) und steht zu Beginn des Abschnitts. Gib mir nur den Betrag in Euro aus (z.B. 23542,23 EUR). Falls kein Betrag vorhanden ist und die Klage abgewiesen wurde (hierbei wird im Text vermittelt, dass die Klage des 'Klägers/-in' oder der 'Klagepartei' abgelehnt wurde.
+Auch kann im Text stehen, dass die Berufung der Klagepartei abgewiesen oder zurückgewiesen wurde.), soll dies als Klage abgewiesen angezeigt werden. Achte darauf, dass der Streitwert nicht extrahiert wird.Sollte jedoch im Text nichts zu die Klage des Klägers bzw. der Klägerin
+wird abgewiesen oder der Kläger bzw. die Klägerin erhält Anspruch auf
+Schadensersatz stehen, sondern es wird ein anderes Verfahren betrachtet bzw. ein
+Ablehnungsgesuch der oder des Beklagten wird verworfen, es wird eine
+Streitwertfestsetzung betrachtet, es wird eine Gerichtsstandbestimmung erwähnt oder
+abgelehnt oder eine Entscheidung des Senats thematisiert, dann gebe dies als
+Sonstige aus. Achte dabei vor allem darauf, ob im Text Streitwertfestsetzung
+(einschließlich dessen Ablehnung), Ablehnungsgesuch oder Entscheid des Senats
+thematisiert und ausgeführt wird. Dies sind Indizien für die Kategorie 'Sonstige'.
+Handelt es sich um die Kategorie 'Sonstige', dann gib mit an, woran du dies
+festgemacht hast. Falls ein Betrag existiert: Gib nur den Betrag aus (z.B. 23542,23 EUR). Falls Klage abgewiesen: Antworte nur mit 'Klage abgewiesen'.Falls Sonstiges: Antworte nur mit 'Sonstige: [Grund]' Und die Tabelle soll nur einen Eintrag haben."
+
+```
+
+
+KI-gestützte Extraktion (Block 1 bis 3)
+
+In den folgenden Abschnitten wird die Gemini-API aufgerufen, um für jeden Block die Zielvariablen aus dem Tenor zu extrahieren. Zur Datensicherheit werden die Ergebnisse unmittelbar als Backup-Dateien lokal gesichert.
+```{r LLM Verarbeitung 1}
+
+chat = chat_google_gemini(api_key = "API Platzhalter")
+llm_use(chat)
+
+    teil_1 <- urteile_1 %>%
+      llm_custom(
+        col = tenor_extrakt,
+        prompt = mein_prompt
+      )
+saveRDS(teil_1, "teil_1_backup.rds")
+
+```
+
+```{r LLM Verarbeitung 2}
+
+chat = chat_google_gemini(api_key = "API Platzhalter")
+llm_use(chat)
+
+    teil_2 <- urteile_2 %>%
+      llm_custom(
+        col = tenor_extrakt,
+        prompt = mein_prompt
+      )
+saveRDS(teil_2, "teil_2_backup.rds")
+
+```
+
+```{r LLM Verarbeitung 3}
+
+chat = chat_google_gemini(api_key = "API Platzhalter")
+llm_use(chat)
+
+    teil_3 <- urteile_3 %>%
+      llm_custom(
+        col = tenor_extrakt,
+        prompt = mein_prompt
+      )
+saveRDS(teil_3, "teil_3_backup.rds")
+
+```
+
+
+Zusammenführung und numerische Aufbereitung der Ergebnisse
+
+Die separat verarbeiteten Datenblöcke werden wieder vereint. Anschließend erfolgt die Bereinigung der extrahierten Texte: Währungssymbole und Formatierungen werden entfernt, um eine rein numerische Spalte für die Schadensersatzsumme sowie eine binäre Erfolgs-Variable zu erstellen.
+```{r Ergebnisse Zusammenführen & Reinigung}
+
+urteile_nach_prompt = bind_rows(teil_3, teil_2, teil_1
+                                ) %>%
+  rename(ergebnis_text = last_col()) %>%
+  mutate(
+    ergebnis_text = as.character(ergebnis_text),
+    ergebnis_betrag_num = ergebnis_text %>% 
+      str_replace_all("\\.", "") %>%      
+      str_replace(",", ".") %>%          
+      str_extract("\\d+\\.?\\d*") %>%    
+      as.numeric(),
+    
+    erfolg = if_else(!is.na(ergebnis_betrag_num) & ergebnis_betrag_num > 0, "Ja", "Nein"),
+    erfolg = coalesce(erfolg, "Nein"),
+    
+    gerichtstyp = "LG") 
+
+saveRDS(urteile_nach_prompt, "urteile_nach_LLM.rds")
+
+```
+
+
+Extraktion der Sachverhaltsmerkmale (Features) via LLM
+
+Mithilfe eines zweiten, spezifischen Prompts extrahiert das LLM nun technische Details aus dem Tatbestand. Hierzu gehören der Kaufpreis, der Kilometerstand, die Marke sowie Fahrzeugzustand, Motortyp und Hubraum. Diese werden auch nachher für die Schätzung fehlender Werte bei Kaufpreis und KM-Stand wichtig. Die Ausgabe erfolgt strukturiert im JSON-Format.
+```{r X Variablen extrahieren }
+chat = chat_google_gemini(api_key = "API Platzhalter")
+llm_use(chat)
+
+mein_prompt <- "
+Du bist ein juristischer Daten-Analyst. Deine Aufgabe ist es, technische und finanzielle Details aus dem 'Tatbestand' eines Urteils zum Abgasskandal zu extrahieren.
+
+### EXTRAKTIONS-REGELN:
+1. KAUFPREIS:
+Suche nach Beträgen in Euro (EUR, € Euro). Achte auf Formulierungen wie 'für ... erworben', 'zahlte ...', 'Rechnung über ...', ‚Gesamtkaufpreis.. ' ‚Kaufpreis i.H.v.', 'Darlehen zur Finanzierung von ...'. Gib nur die reine Zahl zurück.
+2. KILOMETERSTAND:
+Suche nach Kilometerangaben im Kontext des Erwerbs. Oft steht dort nur eine Zahl mit 'km' (z.B. 'mit einer Laufleistung von 15.000 km'). Wenn zwei KM-Stände dastehen, nimm den niedrigeren (das ist meist der beim Kauf).Bei einem Neuwagen trage 0 ein.
+3. ZUSTAND:
+- 'Neuwagen': Wenn Begriffe wie 'Neufahrzeug', 'Neuwagen‘, 'fabrikneu', 'neuen PKW' fallen oder der KM-Stand bei Kauf 0 bis 100 km beträgt.
+- 'Gebrauchtwagen': Wenn explizit 'gebraucht','Gebrauchtfahrzeug' etc. steht oder der KM-Stand beim Kauf deutlich über 100 km liegt.
+4. MOTOR: Extrahiere Codes der Motorenbaureihe wie EA 189, EA 288, OM 642, EA189. 
+5. MODELL:
+Extrahiere die Fahrzeugmarke z.B. VW, Audi ‚Mercedes, ŠKODA, SEAT, CUPRA, Lamborghini, Bentley, Porsche und Ducati etc.Aber gib mir immer nur den Namen der Marke als ein Wort zurück, also z.B bei 'Audi SQ5' gibt mir nur 'Audi'oder bei 'Porsche Cayenne 3.0 TDI' nur 'Porsche'. Wenn von'Fahrzeugs der Marke A.' die Rede ist, ist wahrscheinich auch 'Audi' gemeint. Wenn 'Cayenne' da steht ist 'Porsche' gemeint.
+6. HUBRAUM:
+Extrahiere mir die Daten zum Hubraum. Gib mir da die Literzahl zurück, aber nur die Zahl: z.B 3.0. Wenn Codes wie '3.0 TDI'oder '2.0 TDI', '2,0 Liter TDI', '3.0L V6 TDI' stehen, gib mir nur die Zahl. 
+
+
+### ANTWORT-FORMAT:
+Antworte NUR mit einem validen JSON-Objekt. Verwende NA wenn eine Info fehlt.
+Format:
+{
+ 'kaufpreis_euro': (Zahl),
+ 'km_stand_kauf': (Zahl),
+ 'zustand': ('Neuwagen' oder 'Gebrauchtwagen'),
+ 'motortyp': (String),
+ 'hubraum': (String),
+ 'fahrzeugmodell': (String)
+}
+
+
+### TEXT ZUM ANALYSIEREN:
+"
+
+# KI-Extraktion 
+urteile_nach_ki = urteile_nach_prompt %>% # beim finalen Durchlauf durch "urteile_nach_prompt" ersetzen 
+  llm_custom(
+    col = tatbestand_extrakt, 
+    prompt = mein_prompt,
+    pred_name = "json_raw" # Antwort landet in dieser Spalte
+  )
+
+
+```
+
+
+Speicherung der extrahierten Features
+
+Die Rohdaten der KI-Extraktion werden zwischengespeichert, um den Fortschritt zu sichern.
+```{r Zwischenspeichern}
+
+saveRDS(urteile_nach_ki, "urteile_nach_LLM_2.rds")
+```
+
+
+Parsing der JSON-Daten und Typtransformation
+
+In diesem Sschritt wird das vom LLM gelieferte JSON-Format geparst. Die extrahierten Merkmale werden in einzelne Spalten überführt. Dabei findet eine explizite Typumwandlung statt, um sicherzustellen, dass Kaufpreise, Kilometerstände als numerische Datentypen für die Modellierung vorliegen.
+```{r LLM Verarbeitung }
+
+urteile_final = urteile_nach_ki %>% 
+ mutate(json_raw = map(json_raw, function(x) {
+
+  json_clean = str_extract(x, "(?s)\\{.*\\}")
+
+  res = tryCatch({
+  fromJSON(json_clean)
+  }, error = function(e) NULL)
+
+
+ tibble(
+  kaufpreis_euro = as.character(res$kaufpreis_euro %||% NA),
+  km_stand_kauf = as.character(res$km_stand_kauf %||% NA),
+  zustand  = as.character(res$zustand %||% NA),
+  motortyp = as.character(res$motortyp %||% NA),
+  marke = as.character(res$fahrzeugmodell %||% NA),
+  hubraum = as.character(res$hubraum %||% NA)
+  )
+ })) %>%
+ unnest(json_raw) %>% 
+mutate(
+ kaufpreis_euro = as.numeric(str_replace_all(kaufpreis_euro, "[^0-9.]", "")),
+ km_stand_kauf = as.numeric(str_replace_all(km_stand_kauf, "[^0-9.]", ""))
+ )
+```
+
+
+Speicherung des bereinigten Datensatzes
+
+Der nun strukturierte und typkorrekte Datensatz wird lokal gesichert.
+```{r Zwischenspeichern}
+
+saveRDS(urteile_final, "urteile_final.rds")
+```
+
+
+Datenharmonisierung und Kategorienbereinigung
+
+In diesem Prozessschritt werden die vom Large Language Model (LLM) extrahierten Merkmale vereinheitlicht, um eine konsistente Datenbasis für die statistische Modellierung zu schaffen. Unterschiedliche Schreibweisen für denselben Hersteller (z. B. „VW“ und „Volkswagen“) werden konsolidiert. Zudem werden kryptische Kürzel oder fehlerhafte Extraktionen, die keinen Informationswert für die Prognose besitzen, konsequent als „Unbekannt“ deklariert.
+Motortypen, die im gesamten Datensatz weniger als zweimal vorkommen, werden ebenfalls der Kategorie „Unbekannt“ zugeordnet. Diese Reduktion der Komplexität schützt das spätere Machine-Learning-Modell vor Overfitting, da es daran gehindert wird, Regeln für statistisch nicht signifikante Einzelfälle zu bilden.
+```{r Vereinheitlichen}
+
+library(dplyr)
+library(stringr)
+library(tidyr)
+
+urteile_final_2 <- urteile_final %>%
+  mutate(
+  marke = case_when(
+  marke %in% c("VW", "Volkswagen") ~ "VW",
+  marke %in% c("Škoda", "ŠKODA", "Skoda") ~ "ŠKODA",
+  marke == "Seat" ~ "SEAT",
+  marke %in% c("C2", "J.", "S.", "T.", "G.","W1", "W2", "xxx", "NA") ~ "Unbekannt",
+  is.na(marke) ~ "Unbekannt",
+  nchar(as.character(marke)) <= 1 ~ "Unbekannt",
+  TRUE ~ marke
+  ),
+ 
+
+  motortyp = str_replace_all(motortyp, "[ -]", ""),
+  motortyp = case_when(
+ is.na(motortyp) | motortyp == "NA" ~ "Unbekannt",
+  motortyp %in% c("$$...#EU5", "$$000", "$$...#1", "$$001", "F", "F000",
+  "TypF", "XY...#", "$$...#") ~ "Unbekannt",
+
+  motortyp %in% c("EA897VTDI", "EA897oderEA896Gen2", "EA897Gen2Evo",
+  "EA897EVO", "EA897evo", "EA897Euro6", "EA897") ~ "EA897",
+
+  motortyp %in% c("EA8962G", "EA896Gen2", "EA896") ~ "EA896",
+ 
+  motortyp %in% c("V6TDIEU6", "V6TDI", "V6EU6", "V6Dieselmotor", "V6Diesel") ~ "V6",
+ 
+  TRUE ~ motortyp
+  ),
+
+  hubraum = case_when(
+  is.na(hubraum) | hubraum == "NA" ~ "Unbekannt",
+  TRUE ~ as.character(hubraum)
+  )
+  )
+
+seltene_motoren = urteile_final_2 %>%
+ count(motortyp) %>%
+ filter(n < 2) %>%
+ pull(motortyp)
+
+urteile_final_2 = urteile_final_2 %>%
+ mutate(motortyp = case_when(
+  motortyp %in% seltene_motoren ~ "Unbekannt",
+  TRUE ~ motortyp
+ ))
+```
+
+
+Bereinigung von Ausreißern
+
+Um die Modellgüte nicht durch extreme Datenfehler zu verzerren, werden identifizierte Ausreißer (z. B. fehlerhaft extrahierte Millionenbeträge) aus dem Datensatz entfernt.
+```{r Urteile entfernen}
+
+urteile_final_3 = urteile_final_2 %>%
+  filter(!ergebnis_betrag_num %in% c(3186926.06, 81.43))
+
+message("Verbleibende Urteile im Datensatz: ", nrow(urteile_final_3))
+
+saveRDS(urteile_final_3, "urteile_final_3.rds")
+
+```
+
+
+Erstellung von Trainings- und Testdaten
+
+Der Datensatz wird in einen Trainingsdatensatz (80 %) und einen Testdatensatz (20 %) aufgeteilt. Durch das Setzen eines Seeds wird die Reproduzierbarkeit der Aufteilung gewährleistet.
+```{r Train-Test-Split}
+
+set.seed(123)
+n = nrow(urteile_final_3) 
+
+n_train = floor(0.8 * n)
+n_test   = floor(n- n_train)
+
+lose = c(rep(1, n_train), rep(2, n_test))
+
+indices = sample(lose)
+
+
+train_df = urteile_final_3[indices == 1, ]
+test_df  = urteile_final_3[indices == 2, ]
+
+saveRDS(test_df, "test_df.rds")
+
+```
+
+
+Imputation fehlender Werte mittels MICE
+
+Da einige Urteile unvollständige Sachverhaltsangaben enthalten, wird das MICE-Verfahren angewendet. Hierbei werden fehlende Werte beim Kaufpreis und Kilometerstand auf Basis der Korrelationen innerhalb des Trainingsdatensatzes (Predictive Mean Matching) statistisch geschätzt, um die Datenbasis zu vervollständigen.
+```{r Fehlende Werte behandeln nur auf Trainingsdatensatz}
+
+library(mice)
+
+eingangs_daten = train_df %>%
+  select(kaufpreis_euro, km_stand_kauf, motortyp, zustand, hubraum, marke) %>%
+  mutate(across(c(motortyp, zustand, hubraum, marke), as.factor))
+
+mice_mod = mice(eingangs_daten, m = 5, method = 'pmm', seed = 123)
+
+fertige_daten = complete(mice_mod)
+
+
+```
+
+
+Integration der imputierten Werte in den Trainingsdatensatz
+
+Nachdem das MICE-Verfahren Schätzwerte für die fehlenden Datenpunkte generiert hat, werden diese in den ursprünglichen Trainingsdatensatz integriert. Dabei wird eine logische Überprüfung (ifelse) angewandt: Bestehende Originaldaten bleiben unangetastet, während ausschließlich die durch das LLM nicht extrahierbaren Werte (NAs) durch die statistisch geschätzten Werte aus dem MICE-Modell ersetzt werden.
+```{r In den Datensatz ergänzen}
+
+train_df$kaufpreis_euro = ifelse(is.na(train_df$kaufpreis_euro), 
+                                         fertige_daten$kaufpreis_euro, 
+                                         train_df$kaufpreis_euro)
+
+train_df$km_stand_kauf = ifelse(is.na(train_df$km_stand_kauf), 
+                                        fertige_daten$km_stand_kauf, 
+                                        train_df$km_stand_kauf)
+
+colSums(is.na(train_df[, c("kaufpreis_euro", "km_stand_kauf")]))
+```
+
+
+Speicherung des Trainings-Datensatzes
+
+Der Trainingsdatensatz wird zur weiteren Verwendung im Modelltraining gespeichert.
+```{r train_df final speichern}
+
+saveRDS(train_df, "train_df.rds")
+```
+
+
+
+
