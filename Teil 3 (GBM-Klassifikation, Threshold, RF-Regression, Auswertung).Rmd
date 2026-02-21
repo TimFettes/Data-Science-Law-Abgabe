@@ -1,0 +1,229 @@
+---
+title: "GBM-Klassifikation, Threshold, RF-Regression, Auswertung"
+author: "Tim"
+date: "2026-02-06"
+output: html_document
+---
+
+Im zweiten Teil werden die im ersten Teil erzeugten Features weiterverwendet, um zwei Modelle zu trainieren. Erstens wird ein Klassifikationsmodell erstellt, das den Prozesserfolg als Ja/Nein vorhersagt. Zweitens wird für erfolgreiche Fälle ein Regressionsmodell trainiert, das die zugesprochene Schadenssumme schätzt. Als Grundlage dient die exportierte Feature-Tabelle, die Hardfacts, technische Variablen und Topic-Anteile enthält.
+
+```{r pakete_und_pfad}
+library(rpart)
+library(rpart.plot)
+library(ranger)
+library(vip)
+library(dplyr)
+library(caret)
+library(randomForest)
+```
+
+```{r}
+setwd("C:/Users/timfe/OneDrive/Dokumente/5. Studium/Master Ulm/Data Science & Law")
+```
+
+
+Als Datengrundlage wird die im vorherigen Teil exportierte Tabelle geladen. Diese enthält bereits die Topic-Features aus dem LDA sowie die zusätzlich extrahierten Indikator-Variablen, sodass hier keine erneute Textverarbeitung mehr nötig ist.
+
+```{r}
+data = read.csv("tabelle_training_lda.csv")
+```
+
+
+# Erfolgsprognose mit Gradient Boosting
+
+Für die Erfolgsprognose wird ein Gradient Boosting Modell verwendet. Die Zielvariable wird als Faktor kodiert und es werden nur die für das Modell relevanten Prädiktoren ausgewählt. Neben den Hardfacts und technischen Dummies werden hier zusätzlich numerische Vertragsmerkmale einbezogen, insbesondere Kaufpreis und Kilometerstand zum Kauf. Fehlende Werte werden entfernt, um eine konsistente Trainingsmatrix zu erhalten.
+
+Die Validierung erfolgt per 10-facher Cross-Validation. Da häufig eine Klassenunwucht vorliegt, wird Downsampling eingesetzt, um das Übergewicht der Mehrheitsklasse im Training zu reduzieren. Als Optimierungskriterium wird die AUC (ROC) verwendet, wodurch das Modell auf Trennschärfe und probabilistische Qualität optimiert wird. Ein breiteres Hyperparameter-Grid testet unterschiedliche Lernraten, Baumtiefen, Baumanzahlen und Mindestblattgrößen.
+
+```{r}
+library(caret)
+library(gbm)
+
+data_gbm <- data %>%
+  mutate(erfolg = factor(erfolg, levels = c("Ja", "Nein"))) %>%
+  select(erfolg, has_update, motortyp, hubraum, zustand, 
+         has_verjaehrung, has_ruecktritt, has_sittenwidrig,
+         kaufpreis_euro, km_stand_kauf, starts_with("thema_")) %>%
+  na.omit()
+
+ctrl <- trainControl(
+  method = "cv", 
+  number = 10, 
+  savePredictions = "final",
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  sampling = "down"
+)
+
+gbm_grid <- expand.grid(
+  n.trees = c(1000, 2000),
+  interaction.depth = c(3, 5),
+  shrinkage = c(0.01, 0.05),
+  n.minobsinnode = c(10, 20)
+)
+
+set.seed(123)
+gbm_modell <- train(
+  erfolg ~ ., 
+  data = data_gbm %>% select(erfolg, has_update, motortyp, hubraum, zustand, 
+                             has_verjaehrung, has_ruecktritt, has_sittenwidrig,
+                             kaufpreis_euro, km_stand_kauf, starts_with("thema_")), 
+  method = "gbm",
+  trControl = ctrl,
+  metric = "ROC",
+  tuneGrid = gbm_grid,
+  verbose = FALSE
+)
+
+print(gbm_modell)
+plot(gbm_modell)
+
+saveRDS(gbm_modell, "gbm_modell_final.rds")
+```
+
+
+# Schwellenwert-Optimierung für die Entscheidung Ja/Nein
+
+Da das GBM Wahrscheinlichkeiten liefert, kann die finale Klassenzuweisung über einen Schwellenwert gesteuert werden. Um einen sinnvollen Tradeoff zwischen Precision und Recall zu erreichen, wird der Threshold datengetrieben gewählt. Dafür werden die gespeicherten Cross-Validation-Vorhersagen genutzt und für viele mögliche Thresholds jeweils eine Confusion Matrix sowie der zugehörige F1-Score berechnet. Der Threshold mit dem höchsten F1-Score wird gespeichert, um ihn später in einer Anwendung konsistent wiederzuverwenden.
+
+```{r}
+cv_preds <- gbm_modell$pred
+
+ths <- seq(0.1, 0.9, by = 0.01)
+best_t_data <- lapply(ths, function(t) {
+  yhat <- factor(ifelse(cv_preds$Ja >= t, "Ja", "Nein"), levels = c("Ja", "Nein"))
+  cm <- confusionMatrix(yhat, cv_preds$obs, positive = "Ja")
+  data.frame(threshold = t, F1 = cm$byClass["F1"])
+}) %>% bind_rows()
+
+best_threshold <- best_t_data$threshold[which.max(best_t_data$F1)]
+saveRDS(best_threshold, "optimaler_threshold.rds")
+```
+
+
+# Visualisierungen und Modellinterpretation
+
+Zur Interpretation werden zwei Arten von Ergebnissen aufbereitet. Erstens wird die Variable Importance für das Klassifikationsmodell und das Regressionsmodell visualisiert. Dazu werden Rohvariablennamen in sprechende Labels übersetzt, um Themen, Hardfacts und Vertragsmerkmale verständlich zu machen. Zweitens wird die Schwellenwert-Optimierung grafisch dargestellt, sodass die Wahl des optimalen Threshold nachvollziehbar bleibt. Drittens wird die Güte der Schadensschätzung geprüft, indem tatsächliche und vorhergesagte Werte gegenübergestellt werden. Eine ideale Vorhersage würde auf der Diagonalen liegen.
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(scales)
+
+themen_namen_map <- c(
+  "thema_1" = "T1: Europarecht & Grenzwerte",
+  "thema_2" = "T2: Gewährleistung & Täuschung",
+  "thema_3" = "T3: Rückabwicklung & Nutzung",
+  "thema_4" = "T4: Prozessuale Formalia",
+  "thema_5" = "T5: Vorstandschaft & Strategie",
+  "thema_6" = "T6: Emissionen & Prüfstand",
+  "thema_7" = "T7: Abschalteinrichtungen (AGR/SCR)",
+  "has_sittenwidrig" = "Hardfact: Sittenwidrigkeit (§826)",
+  "has_update" = "Hardfact: Software-Update",
+  "has_verjaehrung" = "Hardfact: Verjährung",
+  "has_ruecktritt" = "Hardfact: Rücktritt",
+  "kaufpreis_euro" = "Vertrag: Kaufpreis",
+  "km_stand_kauf" = "Vertrag: KM-Stand bei Kauf",
+  "motortyp" = "Technik: Motortyp EA189",
+  "hubraum" = "Technik: Hubraum 2.0L",
+  "zustand" = "Technik: Neuwagen"
+)
+
+imp_gbm <- caret::varImp(gbm_modell, scale = TRUE)$importance %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "Merkmal") %>%
+  mutate(Merkmal = ifelse(Merkmal %in% names(themen_namen_map), themen_namen_map[Merkmal], Merkmal)) %>%
+  filter(Overall > 0)
+
+ggplot(imp_gbm, aes(x = reorder(Merkmal, Overall), y = Overall)) +
+  geom_bar(stat = "identity", fill = "#2c3e50") +
+  coord_flip() +
+  labs(
+    title = "Einflussfaktoren auf den Prozesserfolg (GBM)",
+    subtitle = "Welche Merkmale sprechen eher für eine Bejahung des Anspruchs?",
+    x = NULL,
+    y = "Wichtigkeit (0-100)"
+  ) +
+  theme_minimal()
+
+imp_rf <- caret::varImp(rf_regr_modell, scale = TRUE)$importance %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "Merkmal") %>%
+  mutate(Merkmal = ifelse(Merkmal %in% names(themen_namen_map), themen_namen_map[Merkmal], Merkmal)) %>%
+  filter(Overall > 0)
+
+ggplot(imp_rf, aes(x = reorder(Merkmal, Overall), y = Overall)) +
+  geom_bar(stat = "identity", fill = "#c0392b") +
+  coord_flip() +
+  labs(
+    title = "Einflussfaktoren auf die Schadenshöhe (Random Forest)",
+    subtitle = "Welche Merkmale beeinflussen die prognostizierte Schadenssumme besonders stark?",
+    x = NULL,
+    y = "Wichtigkeit (0-100)"
+  ) +
+  theme_minimal()
+
+ggplot(best_t_data, aes(x = threshold, y = F1)) +
+  geom_line(color = "#2980b9", linewidth = 1) +
+  geom_vline(xintercept = best_threshold, linetype = "dashed", color = "red") +
+  annotate(
+    "text",
+    x = best_threshold + 0.05,
+    y = min(best_t_data$F1),
+    label = paste("Optimaler Threshold:", round(best_threshold, 2)),
+    hjust = 0
+  ) +
+  labs(
+    title = "Optimierung des Entscheidungsschwellenwerts",
+    subtitle = "F1-Maximierung zur Balance von Precision und Recall",
+    x = "Schwellenwert (Wahrscheinlichkeit)",
+    y = "F1-Score"
+  ) +
+  theme_minimal()
+
+regr_preds <- predict(rf_regr_modell, data_regr)
+
+ggplot(
+  data.frame(Actual = data_regr$schadenssumme, Predicted = regr_preds),
+  aes(x = Actual, y = Predicted)
+) +
+  geom_point(alpha = 0.5, color = "black") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linewidth = 1) +
+  scale_x_continuous(labels = dollar_format(suffix = " €", prefix = "")) +
+  scale_y_continuous(labels = dollar_format(suffix = " €", prefix = "")) +
+  labs(
+    title = "Güte der Schadensschätzung",
+    subtitle = "Vergleich: Tatsächlich zugesprochene vs. geschätzte Summe",
+    x = "Reale Schadenssumme (aus den Urteilen)",
+    y = "Vorhergesagte Summe (Random Forest)"
+  ) +
+  theme_minimal()
+```
+
+
+# Kompakte Übersicht der Modellkennzahlen
+
+Zum Abschluss werden die wichtigsten Kennzahlen für beide Modelle in einer Tabelle zusammengefasst. Für das GBM werden aus den besten Cross-Validation-Ergebnissen die ROC sowie Sensitivität und Spezifität extrahiert. Der F1-Score wird aus der zuvor durchgeführten Threshold-Optimierung übernommen. Für den Random Forest werden die bestmöglichen Werte aus der Cross-Validation anhand minimaler RMSE ausgewählt und zusammen mit R² und MAE berichtet.
+
+```{r}
+gbm_perf <- gbm_modell$results %>%
+  filter(ROC == max(ROC)) %>%
+  slice(1) %>%
+  select(ROC, Sens, Spec)
+
+best_f1 <- max(best_t_data$F1, na.rm = TRUE)
+
+rf_perf <- rf_regr_modell$results %>%
+  filter(RMSE == min(RMSE)) %>%
+  slice(1) %>%
+  select(RMSE, Rsquared, MAE)
+
+stats_uebersicht <- data.frame(
+  Modell = c("Erfolgsprognose (GBM)", "Schadenssumme (RF)"),
+  Metrik_1 = c(paste("ROC:", round(gbm_perf$ROC, 3)), paste("R²:", round(rf_perf$Rsquared, 3))),
+  Metrik_2 = c(paste("F1-Score:", round(best_f1, 3)), paste("RMSE:", round(rf_perf$RMSE, 2), "€")),
+  Metrik_3 = c(paste("Sensitivity:", round(gbm_perf$Sens, 3)), paste("MAE:", round(rf_perf$MAE, 2), "€"))
+)
+
+print(stats_uebersicht)
+```

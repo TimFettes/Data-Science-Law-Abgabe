@@ -1,0 +1,349 @@
+---
+title: "Testdaten-Pipeline, Inference, Evaluation, Export"
+author: "Tim"
+date: "2026-02-06"
+output: html_document
+---
+
+
+# Anwendung auf Testdaten und finale Evaluation
+
+Der dritte Teil setzt die zuvor trainierten Modelle in einer konsistenten “Inference-Pipeline” ein. Dazu werden das finale LDA-Modell, das Trainingsvokabular sowie die trainierten ML-Modelle geladen. Anschließend werden die Testdaten in derselben Struktur wie die Trainingsdaten vorbereitet, Hardfacts erneut extrahiert und der Tatbestand identisch bereinigt. Über das Trainingsvokabular wird eine kompatible DTM gebaut, sodass die Posterior-Berechnung des LDA-Modells auf die Testdokumente angewendet werden kann. Die daraus entstehenden Topic-Anteile werden mit den Hardfacts zusammengeführt und dienen als Input für die Erfolgsprognose (GBM) und die Schadensschätzung (Random Forest). Abschließend erfolgt eine Auswertung über Confusion Matrix sowie Regressionskennzahlen und Visualisierungen.
+
+```{r pakete_und_pfad}
+library(httr)
+library(rvest)
+library(stringr)
+library(tm)
+library(dplyr)
+library(textstem)
+library(tidytext)
+library(tidyr)
+library(ggplot2)
+library(topicmodels)
+library(wordcloud)
+library(tidyverse)
+library(slam)
+library(caret)
+
+setwd("C:/Users/timfe/OneDrive/Dokumente/5. Studium/Master Ulm/Data Science & Law/Version Maria")
+```
+
+
+Zunächst werden alle Artefakte geladen, die für die Reproduktion der Trainingspipeline und die Anwendung auf neue Dokumente nötig sind. Dazu gehören das LDA-Modell, das Trainingsvokabular, die Topic-Namen, das Klassifikationsmodell (GBM), das Regressionsmodell (Random Forest), der optimierte Threshold sowie die manuelle Stopwortliste für die Textbereinigung.
+
+```{r}
+final_lda <- readRDS("lda_modell_final.rds")
+vokabular <- readRDS("trainings_vokabular.rds")
+themen_namen <- readRDS("themen_namen.rds")
+final_gbm <- readRDS("gbm_modell_final.rds")
+final_rf_reg <- readRDS("rf_regr_modell_final.rds")
+best_t <- readRDS("optimaler_threshold.rds")
+manuelle_stoppwörter <- readRDS("manuelle_stoppwörter.rds")
+```
+
+
+Die Testdaten werden geladen und in dieselbe Form gebracht wie die Trainingsdaten. Unnötige Spalten werden entfernt, Spalten werden analog benannt, und technische Merkmale werden als Dummy-Variablen kodiert. Dadurch ist sichergestellt, dass die spätere Feature-Auswahl und Modellanwendung ohne Strukturbruch funktioniert.
+
+```{r}
+test <- readRDS("C:/Users/timfe/OneDrive/Dokumente/5. Studium/Master Ulm/Data Science & Law/urteile_test.rds")
+
+test <- test %>%
+  select(-gerichtstyp, -tenor_extrakt, -ergebnis_text, -text, -marke) %>%
+  rename(tatbestand = tatbestand_extrakt, schadenssumme = ergebnis_betrag_num) %>%
+  mutate(
+    motortyp = ifelse(motortyp == "EA189", 1, 0),
+    hubraum = ifelse(hubraum == 2.0, 1, 0),
+    zustand = ifelse(zustand == "Neuwagen", 1, 0)
+  )
+```
+
+
+Als nächstes werden die gleichen Hardfacts wie im Training extrahiert. Dafür wird der Tatbestand zunächst normalisiert, um Schreibweisen und Whitespace zu vereinheitlichen. Darauf aufbauend erkennen reguläre Ausdrücke technische Hinweise wie ein Software-Update sowie juristische Begriffe wie Verjährung, Rücktritt oder Sittenwidrigkeit. Die Ergebnisse werden als Dummy-Variablen an den Testdatensatz angefügt und die ursprünglichen Textspalten werden entfernt, weil die weiteren Schritte mit der bereinigten Textversion separat arbeiten.
+
+```{r}
+normalize_raw = function(x) {
+  x = tolower(x)
+  x = str_replace_all(x, "\u00A0", " ")
+  x = str_replace_all(x, "[\r\n\t]+", " ")
+  x = str_replace_all(x, "\\s+", " ")
+  x
+}
+
+extract_tech_flags = function(text) {
+  if(is.na(text)) return(c(has_update = 0L))
+  res = str_detect(text, regex("\\b(software\\-?update|update|rückruf|nachbesserung)\\b", ignore_case = TRUE))
+  c(has_update = as.integer(res))
+}
+
+extract_legal_flags = function(text) {
+  if(is.na(text)) return(c(has_verjaehrung = 0L, has_ruecktritt = 0L, has_sittenwidrig = 0L))
+  c(
+    has_verjaehrung = as.integer(str_detect(text, regex("verjähr", ignore_case = TRUE))),
+    has_ruecktritt  = as.integer(str_detect(text, regex("rücktritt", ignore_case = TRUE))),
+    has_sittenwidrig = as.integer(str_detect(text, regex("sittenwidrig", ignore_case = TRUE)))
+  )
+}
+
+test_hardfacts <- test %>%
+  mutate(tatbestand_raw = normalize_raw(tatbestand))
+
+tech_flags_df <- map_dfr(test_hardfacts$tatbestand_raw, extract_tech_flags)
+legal_flags_df <- map_dfr(test_hardfacts$tatbestand_raw, extract_legal_flags)
+
+test_hardfacts <- test_hardfacts %>%
+  bind_cols(tech_flags_df, legal_flags_df) %>%
+  select(-tatbestand, -tatbestand_raw)
+```
+
+
+Für die Berechnung der Topics muss der Tatbestand identisch zur Trainingspipeline bereinigt werden. Die Funktion erstellt einen Corpus, entfernt Sonderzeichen, vereinheitlicht domänenspezifische Schreibweisen, entfernt Stopwörter, entfernt Gesetzesverweise und lemmatisiert die Tokens. Damit die Topic-Projektion später stabil ist, wird außerdem sichergestellt, dass kurze Tokens entfernt und Whitespace bereinigt wird. Die bereinigte Textspalte bleibt als Grundlage für Tokenisierung und DTM-Erstellung erhalten.
+
+```{r}
+textverarbeitung = function(text, custom_stopwords) {
+  corpus = VCorpus(VectorSource(text))
+  corpus = tm_map(corpus, content_transformer(tolower))
+  corpus = tm_map(corpus, content_transformer(function(x) str_replace_all(x, "[^[:alpha:][:space:]]", " ")))
+
+  corpus = tm_map(corpus, content_transformer(function(x) {
+    x = str_replace_all(x, "\\bkba\\b", "kraftfahrtbundesamt")
+    x = str_replace_all(x, "\\beur\\b", "euro")
+    x = str_replace_all(x, "\\babschalteinrichtungen\\b", "abschalteinrichtung")
+    x = str_replace_all(x, "\\bmotoren\\b", "motor")
+    x = str_replace_all(x, "\\bunzulässigen\\b", "unzulässige")
+    x = str_replace_all(x, "\\bfin\\b", "fahrzeugidentifikationsnummer")
+    x = str_replace_all(x, "\\btypgenehmigung\\b", "typengenehmigung")
+    x
+  }))
+
+  if(!missing(custom_stopwords)) corpus = tm_map(corpus, removeWords, custom_stopwords)
+
+  corpus = tm_map(corpus, content_transformer(function(x) str_replace_all(x, "§§?\\s*\\d+[a-z]*(\\s*f{1,2}\\.)?", " ")))
+  corpus = tm_map(corpus, removeWords, stopwords("de"))
+  corpus = tm_map(corpus, stripWhitespace)
+  corpus = tm_map(corpus, content_transformer(lemmatize_strings))
+
+  corpus = tm_map(corpus, content_transformer(function(x) str_replace_all(x, "[^[:alpha:][:space:]]", " ")))
+  corpus = tm_map(corpus, content_transformer(function(x) str_replace_all(x, "\\b[[:alpha:]]{1,2}\\b", " ")))
+  corpus = tm_map(corpus, content_transformer(tolower))
+  corpus = tm_map(corpus, stripWhitespace)
+
+  if(!missing(custom_stopwords)) corpus = tm_map(corpus, removeWords, custom_stopwords)
+
+  as.character(sapply(corpus, content))
+}
+
+test_bereingt <- test %>%
+  mutate(tatbestand_bereingt = textverarbeitung(tatbestand, manuelle_stoppwörter)) %>%
+  select(-tatbestand)
+```
+
+
+Anschließend werden aus dem bereinigten Tatbestand Unigrams und Bigrams erzeugt. Beide Tokenmengen werden zusammengeführt, um dieselbe Repräsentation wie im Training zu verwenden. Damit die DTM kompatibel ist, werden Tokens auf das Trainingsvokabular gefiltert.
+
+```{r}
+test_tokens_single <- test_bereingt %>%
+  unnest_tokens(tokens, tatbestand_bereingt) %>%
+  select(dateiname, tokens)
+
+test_tokens_bi <- test_bereingt %>%
+  unnest_tokens(output = tokens, input = tatbestand_bereingt, token = "ngrams", n = 2) %>%
+  select(dateiname, tokens)
+
+test_tokens_all <- bind_rows(test_tokens_single, test_tokens_bi)
+```
+
+
+Für die Posterior-Berechnung des LDA-Modells muss die DTM exakt auf das Trainingsvokabular ausgerichtet werden. Zunächst werden Tokenhäufigkeiten gezählt und auf das Vokabular gefiltert. Danach wird eine DTM erstellt, fehlende Trainingsbegriffe werden mit Null-Spalten ergänzt und die Spaltenreihenfolge wird exakt wie im Training sortiert. Dokumente, die nach der Filterung keine Tokens mehr enthalten, werden entfernt, da sie keine sinnvolle Topic-Verteilung liefern können. Schließlich wird über posterior die Topic-Verteilung für die Testdokumente berechnet und als Feature-Set mit den Hardfacts zusammengeführt.
+
+```{r}
+word_counts_match <- test_tokens_all %>%
+  count(dateiname, tokens) %>%
+  filter(tokens %in% vokabular)
+
+test_dtm <- word_counts_match %>%
+  cast_dtm(document = dateiname, term = tokens, value = n)
+
+missing_terms <- setdiff(vokabular, colnames(test_dtm))
+if (length(missing_terms) > 0) {
+  null_mat <- simple_triplet_matrix(
+    i = rep(1, length(missing_terms)),
+    j = 1:length(missing_terms),
+    v = rep(0, length(missing_terms)),
+    nrow = nrow(test_dtm),
+    ncol = length(missing_terms),
+    dimnames = list(rownames(test_dtm), missing_terms)
+  )
+  test_dtm <- cbind(test_dtm, null_mat)
+}
+
+test_dtm_ready <- test_dtm[, vokabular]
+
+row_sums <- slam::row_sums(test_dtm_ready)
+test_dtm_ready <- test_dtm_ready[row_sums > 0, ]
+
+test_topics_output <- posterior(final_lda, test_dtm_ready)
+test_topic_scores <- as.data.frame(test_topics_output$topics)
+colnames(test_topic_scores) <- paste0("thema_", 1:7)
+test_topic_scores$dateiname <- rownames(test_topic_scores)
+
+test_final <- test_hardfacts %>%
+  inner_join(test_topic_scores, by = "dateiname")
+```
+
+
+Nun werden die Testfeatures in genau der Struktur zusammengestellt, die die beiden Modelle erwarten. Für die Klassifikation werden alle im GBM verwendeten Features gewählt. Fehlende Werte werden pragmatisch auf Null gesetzt, damit die Vorhersage auch bei unvollständigen Metadaten funktioniert. Das GBM liefert Wahrscheinlichkeiten, die über den gespeicherten optimalen Threshold in Ja/Nein übersetzt werden. Für die Regression wird ein reduziertes Feature-Set verwendet und anschließend die Schadenssumme vorhergesagt. Beide Ergebnisse werden in einem finalen Dataframe zusammengeführt und als CSV exportiert.
+
+```{r}
+model_features_gbm <- c(
+  "kaufpreis_euro", "km_stand_kauf", "has_update", "motortyp", "hubraum", "zustand",
+  "has_verjaehrung", "has_ruecktritt", "has_sittenwidrig",
+  paste0("thema_", 1:7)
+)
+
+test_final_gbm <- test_final %>%
+  mutate(across(any_of(model_features_gbm), ~ ifelse(is.na(.), 0, .))) %>%
+  select(all_of(model_features_gbm))
+
+test_probs_gbm <- predict(final_gbm, newdata = test_final_gbm, type = "prob")
+test_predictions_gbm <- ifelse(test_probs_gbm$Ja > best_t, "Ja", "Nein")
+test_predictions_gbm <- factor(test_predictions_gbm, levels = c("Ja", "Nein"))
+
+regr_features <- c(
+  "kaufpreis_euro", "km_stand_kauf", "motortyp", "zustand",
+  "has_update", paste0("thema_", 1:7)
+)
+
+test_final_regr <- test_final %>%
+  mutate(across(any_of(regr_features), ~ ifelse(is.na(.), 0, .)))
+
+test_predictions_euro <- predict(final_rf_reg, newdata = test_final_regr)
+
+efgh <- data.frame(
+  dateiname = test_final$dateiname,
+  erfolg_tatsaechlich = factor(test_final$erfolg, levels = c("Ja", "Nein")),
+  erfolg_prognose = test_predictions_gbm,
+  schadenssumme_tatsaechlich = test_final$schadenssumme,
+  schadenssumme_prognose = test_predictions_euro
+)
+
+print(confusionMatrix(efgh$erfolg_prognose, efgh$erfolg_tatsaechlich, positive = "Ja"))
+
+write.csv(efgh, "Prognose_final_18.csv", row.names = FALSE)
+```
+
+
+Für die Regressionsauswertung werden alle Fälle betrachtet, bei denen sowohl die tatsächliche Schadenssumme als auch eine Prognose vorliegt. MAE misst den durchschnittlichen absoluten Fehler, RMSE bestraft größere Abweichungen stärker, und R² wird hier als quadrierte Korrelation zwischen Ist- und Prognosewert berechnet, um die erklärte Varianz zu quantifizieren.
+
+```{r}
+regr_eval <- efgh %>%
+  filter(!is.na(schadenssumme_tatsaechlich) & !is.na(schadenssumme_prognose))
+
+mae <- mean(abs(regr_eval$schadenssumme_tatsaechlich - regr_eval$schadenssumme_prognose))
+rmse <- sqrt(mean((regr_eval$schadenssumme_tatsaechlich - regr_eval$schadenssumme_prognose)^2))
+r2 <- cor(regr_eval$schadenssumme_tatsaechlich, regr_eval$schadenssumme_prognose)^2
+
+cat("Mittlerer absoluter Fehler (MAE):", round(mae, 2), "Euro\n")
+cat("Root Mean Squared Error (RMSE):", round(rmse, 2), "Euro\n")
+cat("Bestimmtheitsmaß (R²):", round(r2, 4), "\n")
+```
+
+
+Zum Schluss werden die wichtigsten Ergebnisse erneut in einer interpretierbaren Form visualisiert. Eine Mapping-Tabelle übersetzt Topic- und Feature-Namen in verständliche Bezeichnungen. Die Variable Importances zeigen, welche Merkmale die Modelle besonders stark nutzen. Der Scatterplot stellt die Regressionsgüte direkt gegenüber und erlaubt es, systematische Über- oder Unterschätzungen zu erkennen. Zusätzlich wird eine kompakte Tabelle aus der Confusion Matrix und den Regressionskennzahlen erzeugt, um die Ergebnisse übersichtlich zu berichten.
+
+```{r}
+library(gbm)
+library(randomForest)
+library(pROC)
+library(vip)
+library(ggplot2)
+library(dplyr)
+library(scales)
+library(caret)
+
+themen_namen_map <- c(
+  "thema_1" = "T1: Europarechtliche Normen & Grenzwerte",
+  "thema_2" = "T2: Gewährleistungsrecht & Täuschung",
+  "thema_3" = "T3: Rückabwicklung & Nutzungsersatz",
+  "thema_4" = "T4: Prozessuale Identifikation & Formalia",
+  "thema_5" = "T5: Strategische Entwicklung & Vorstandshaftung",
+  "thema_6" = "T6: Abgaswerte und Prüfstandsmessungen",
+  "thema_7" = "T7: Technische Abschalteinrichtungen",
+  "has_sittenwidrig" = "Merkmal: Sittenwidrigkeit",
+  "has_update" = "Merkmal: Software-Update",
+  "has_verjaehrung" = "Merkmal: Verjährung",
+  "has_ruecktritt" = "Merkmal: Rücktritt",
+  "kaufpreis_euro" = "Vertrag: Kaufpreis",
+  "km_stand_kauf" = "Vertrag: KM-Stand bei Kauf",
+  "motortyp" = "Technik: Motortyp EA189",
+  "hubraum" = "Technik: Hubraum",
+  "zustand" = "Technik: Neuwagen"
+)
+
+imp_gbm <- caret::varImp(final_gbm, scale = TRUE)$importance %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "Merkmal") %>%
+  mutate(Merkmal = ifelse(Merkmal %in% names(themen_namen_map), themen_namen_map[Merkmal], Merkmal)) %>%
+  filter(Overall > 0)
+
+ggplot(imp_gbm, aes(x = reorder(Merkmal, Overall), y = Overall)) +
+  geom_bar(stat = "identity", fill = "#2c3e50") +
+  coord_flip() +
+  labs(
+    title = "Einflussfaktoren auf den Prozesserfolg (GBM)",
+    subtitle = "Welche Merkmale tragen besonders stark zur Erfolgsprognose bei?",
+    x = NULL,
+    y = "Wichtigkeit (0-100)"
+  ) +
+  theme_minimal()
+
+imp_rf <- caret::varImp(final_rf_reg, scale = TRUE)$importance %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "Merkmal") %>%
+  mutate(Merkmal = ifelse(Merkmal %in% names(themen_namen_map), themen_namen_map[Merkmal], Merkmal)) %>%
+  filter(Overall > 0)
+
+ggplot(imp_rf, aes(x = reorder(Merkmal, Overall), y = Overall)) +
+  geom_bar(stat = "identity", fill = "#c0392b") +
+  coord_flip() +
+  labs(
+    title = "Einflussfaktoren auf die Schadenshöhe (Random Forest)",
+    subtitle = "Welche Merkmale beeinflussen die Schadensschätzung besonders stark?",
+    x = NULL,
+    y = "Wichtigkeit (0-100)"
+  ) +
+  theme_minimal()
+
+ggplot(regr_eval, aes(x = schadenssumme_tatsaechlich, y = schadenssumme_prognose)) +
+  geom_point(alpha = 0.5, color = "black") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linewidth = 1) +
+  scale_x_continuous(labels = dollar_format(suffix = " €", prefix = "")) +
+  scale_y_continuous(labels = dollar_format(suffix = " €", prefix = "")) +
+  labs(
+    title = "Güte der Schadensschätzung",
+    subtitle = "Vergleich: Tatsächlich zugesprochene vs. prognostizierte Summe",
+    x = "Reale Schadenssumme",
+    y = "Vorhergesagte Schadenssumme"
+  ) +
+  theme_minimal()
+
+cm <- confusionMatrix(efgh$erfolg_prognose, efgh$erfolg_tatsaechlich, positive = "Ja")
+
+stats_uebersicht <- data.frame(
+  Modell = c("Erfolgsprognose (GBM)", "Schadenssumme (RF)"),
+  Metrik_1 = c(
+    paste("Accuracy:", round(cm$overall["Accuracy"], 3)),
+    paste("R²:", round(cor(regr_eval$schadenssumme_tatsaechlich, regr_eval$schadenssumme_prognose)^2, 3))
+  ),
+  Metrik_2 = c(
+    paste("Sensitivity (Recall):", round(cm$byClass["Sensitivity"], 3)),
+    paste("RMSE:", round(sqrt(mean((regr_eval$schadenssumme_tatsaechlich - regr_eval$schadenssumme_prognose)^2)), 2), "€")
+  ),
+  Metrik_3 = c(
+    paste("Precision (Pos Pred Value):", round(cm$byClass["Pos Pred Value"], 3)),
+    paste("MAE:", round(mean(abs(regr_eval$schadenssumme_tatsaechlich - regr_eval$schadenssumme_prognose)), 2), "€")
+  )
+)
+
+print(stats_uebersicht)
+```

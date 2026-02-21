@@ -1,0 +1,494 @@
+---
+title: "Feature Engineering, LDA, CV, Export"
+author: "Tim"
+date: "2026-02-06"
+output: html_document
+---
+
+
+# Setup und Pakete
+
+Zu Beginn werden die globalen Knit-Optionen gesetzt, damit der Code in der Abgabe sichtbar ist. Zusätzlich wird ein Arbeitsverzeichnis gesetzt, sodass die Ein- und Ausgabedateien (RDS, CSV, gespeicherte Modelle) zuverlässig gefunden werden. Falls ihr im Abgabe-Ordner eine feste Struktur habt, kann der Pfad entsprechend angepasst oder durch ein relatives Projekt-Setup ersetzt werden.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+setwd("C:/Users/timfe/OneDrive/Dokumente/5. Studium/Master Ulm/Data Science & Law")
+```
+
+
+Für Datenaufbereitung, Textverarbeitung, Topic Modelling und Machine Learning werden die folgenden Pakete verwendet. tidyverse deckt Datenmanipulation und Visualisierung ab, tm und tidytext sind zentral für Corpus- und Token-Verarbeitung, textstem lemmatisiert Wörter, topicmodels liefert LDA, caret übernimmt Training, Cross-Validation und Kennzahlen. httr und rvest sind für Web-bezogene Aufgaben verfügbar, auch wenn sie im vorliegenden Teil nicht aktiv genutzt werden.
+
+```{r}
+library(tidyverse)
+library(tm)
+library(textstem)
+library(tidytext)
+library(topicmodels)
+library(caret)
+library(httr)
+library(rvest)
+```
+
+
+# Trainingsdaten einlesen und Struktur vorbereiten
+
+Im nächsten Schritt werden ausschließlich die Trainingsdaten geladen. Unwichtige Textspalten werden entfernt, weil für das Modell nur der Tatbestand als Textbasis dient. Zusätzlich werden Variablen umbenannt und drei Merkmale in Dummy-Variablen überführt, damit sie als numerische Features im Modell nutzbar sind.
+
+```{r}
+training = readRDS("urteile_train.rds")
+
+training = training %>%
+  select(-gerichtstyp, -tenor_extrakt, -text, -ergebnis_text, -marke) %>%
+  rename(tatbestand = tatbestand_extrakt, schadenssumme = ergebnis_betrag_num) %>%
+  mutate(
+    motortyp = ifelse(motortyp == "EA189", 1, 0),
+    hubraum = ifelse(hubraum == 2.0, 1, 0),
+    zustand = ifelse(zustand == "Neuwagen", 1, 0)
+  )
+```
+
+
+# Hardfacts aus dem Tatbestand extrahieren
+
+Ergänzend zum Topic Modelling werden regelbasierte Indikatoren aus dem Tatbestand gewonnen, um klar identifizierbare Sachverhalte als zusätzliche Features einzubringen. Dafür wird der Text zuerst standardisiert, indem Groß-/Kleinschreibung vereinheitlicht, Sonderleerzeichen und Zeilenumbrüche entfernt sowie Mehrfachleerzeichen reduziert werden. Anschließend erkennen reguläre Ausdrücke typische Stichwörter, die technische oder juristische Konstellationen anzeigen, und geben dafür Dummy-Variablen (0/1) zurück. Die Funktionen werden auf alle Dokumente angewendet und danach als neue Spalten an den Datensatz angefügt.
+
+```{r}
+normalize_raw = function(x) {
+  x = tolower(x)
+  x = str_replace_all(x, "\u00A0", " ")
+  x = str_replace_all(x, "[\r\n\t]+", " ")
+  x = str_replace_all(x, "\\s+", " ")
+  x
+}
+
+extract_tech_flags = function(text) {
+  if(is.na(text)) return(c(has_update = 0L))
+  res = str_detect(text, regex("\\b(software\\-?update|update|rückruf|nachbesserung)\\b", ignore_case = TRUE))
+  c(has_update = as.integer(res))
+}
+
+extract_legal_flags = function(text) {
+  if(is.na(text)) return(c(has_verjaehrung = 0L, has_ruecktritt = 0L, has_sittenwidrig = 0L))
+  c(
+    has_verjaehrung = as.integer(str_detect(text, regex("verjähr", ignore_case = TRUE))),
+    has_ruecktritt  = as.integer(str_detect(text, regex("rücktritt", ignore_case = TRUE))),
+    has_sittenwidrig = as.integer(str_detect(text, regex("sittenwidrig", ignore_case = TRUE)))
+  )
+}
+```
+
+```{r}
+training_hardfacts = training %>%
+  mutate(tatbestand_raw = normalize_raw(tatbestand))
+
+tech_flags_df = map_dfr(training_hardfacts$tatbestand_raw, extract_tech_flags)
+legal_flags_df = map_dfr(training_hardfacts$tatbestand_raw, extract_legal_flags)
+
+data = training_hardfacts %>%
+  bind_cols(tech_flags_df, legal_flags_df)
+
+dplyr::glimpse(data)
+```
+
+
+# Textvorverarbeitung für Topic Modelling
+
+Für die thematische Modellierung wird der Tatbestand so bereinigt, dass überwiegend semantisch relevante Tokens übrig bleiben. Die Pipeline erstellt einen Corpus, setzt alles auf Kleinbuchstaben und entfernt Zeichen, die keine Buchstaben oder Leerzeichen sind. Danach werden domänenspezifische Varianten vereinheitlicht, beispielsweise Abkürzungen oder alternative Schreibweisen wie KBA, EUR oder FIN.
+
+Anschließend werden Stopwörter entfernt. Neben den deutschen Standard-Stopwörtern wird eine manuelle Liste verwendet, die typische Prozess- und Begründungsformeln enthält, weil diese häufig vorkommen, aber wenig zur thematischen Trennung beitragen. Zusätzlich werden Gesetzesverweise entfernt, Wörter lemmatisiert (Flexionsformen werden auf Grundformen reduziert) und sehr kurze Tokens verworfen.
+
+```{r}
+textverarbeitung = function(text, custom_stopwords) {
+  corpus = VCorpus(VectorSource(text))
+  corpus = tm_map(corpus, content_transformer(tolower))
+  corpus = tm_map(corpus, content_transformer(function(x) str_replace_all(x, "[^[:alpha:][:space:]]", " ")))
+
+  corpus = tm_map(corpus, content_transformer(function(x) {
+    x = str_replace_all(x, "\\bkba\\b", "kraftfahrtbundesamt")
+    x = str_replace_all(x, "\\beur\\b", "euro")
+    x = str_replace_all(x, "\\babschalteinrichtungen\\b", "abschalteinrichtung")
+    x = str_replace_all(x, "\\bmotoren\\b", "motor")
+    x = str_replace_all(x, "\\bfin\\b", "fahrzeugsidentifikationsnummer")
+    x = str_replace_all(x, "\\bfahrzeugidentifikationsnummer\\b", "fahrzeugsidentifikationsnummer")
+    x
+  }))
+
+  if(!missing(custom_stopwords)) corpus = tm_map(corpus, removeWords, custom_stopwords)
+
+  corpus = tm_map(corpus, content_transformer(function(x) str_replace_all(x, "§§?\\s*\\d+[a-z]*(\\s*f{1,2}\\.)?", " ")))
+  corpus = tm_map(corpus, removeWords, stopwords("de"))
+  corpus = tm_map(corpus, content_transformer(lemmatize_strings))
+  corpus = tm_map(corpus, content_transformer(function(x) str_replace_all(x, "\\b[[:alpha:]]{1,2}\\b", " ")))
+  corpus = tm_map(corpus, stripWhitespace)
+
+  if(!missing(custom_stopwords)) corpus = tm_map(corpus, removeWords, custom_stopwords)
+
+  as.character(sapply(corpus, content))
+}
+```
+
+```{r}
+manuelle_stoppwörter <- c(
+  "festgestellt", "feststellen", "ergibt", "ergeben", "resultiert",
+  "beruht", "aufgrund", "insoweit", "insgesamt", "jedenfalls",
+  "vorliegend", "vorliegende", "streitig", "unstreitig",
+  "insbesondere", "bereits", "derzeit", "dergleichen",
+  "nachdem", "soweit", "sofern", "indem", "daher", "folglich",
+  "somit", "hingegen", "jedoch", "ferner", "mithin",
+  "insoweit", "entsprechend",
+  "klage", "kläger", "klägerin", "beklagte", "beklagter",
+  "partei", "parteien", "verfahren", "prozess",
+  "verhandlung", "mündlich", "mündlichen",
+  "antrag", "anträge", "beantragt",
+  "bescheid", "beschluss", "urteil",
+  "anspruch", "ansprüche", "geltend",
+  "verpflichtet", "verpflichtung",
+  "haftung", "haftet",
+  "ersatz", "schadensersatz",
+  "kosten", "prozesskosten",
+  "verzug",
+  "vertrag", "kaufvertrag", "kaufpreis",
+  "leistung", "gegenleistung",
+  "pflicht", "pflichten",
+  "rücktritt", "rückabwicklung",
+  "mangel", "mängel",
+  "nachbesserung",
+  "zeitpunkt", "zeitraum",
+  "kenntnis", "kenntnisstand",
+  "spätestens", "erstmals",
+  "schriftlich", "schriftlichkeitsform",
+  "schriftatz", "schriftätze",
+  "anlage", "anlagen",
+  "ziffer", "absatz", "satz",
+  "behörde", "zuständig", "zuständigkeit",
+  "gericht", "landgericht", "oberlandesgericht",
+  "bundesgerichtshof",
+  "kläger","klägerin","fahrzeugs","fahrzeugen","fahrzeug","fahrzeuge","fahrzeuges","xxx","pkw",
+  "streitgegenständlichen","sowie","seien","wurde","klage","wegen","klägers","anlage","klagepartei",
+  "zug","höhe","bgb","beklagtenpartei","dass","kraftfahrtbundesamt","seit","worden","genannten",
+  "behauptet","jedoch","hierbei","jeweils","zudem","weiteren","gegenüber","art","sinne","nebst",
+  "streitgegenständliche","motor","euro","prozessbevollmächtigten","verpflichtet","verurteilen",
+  "verurteilt","hätte","hätten","könne","genommen","entstandenen","have","schreiben","bezug",
+  "befindet","zinsen","prozentpunkten","unzulässige","basiszinssatz","kfz","zahlen","mehr",
+  "jedenfalls","jeweiligen","kraftfahrt","bundesamt","festgestellt","resultieren","festzustellen",
+  "hilfsweise","aufgrund","ansicht","müsse","maßnahmen","betroffen","geeignete","zeitpunkt","einsatz",
+  "technischen","modus","normalen","kosten","ziffer","strategie","bereits","kaufvertrag","verwendung",
+  "ansprüche","betroffenen","insbesondere","bezahlen","schäden","müssen","typengenehmigung",
+  "auffassung","angaben","hafe","aktuellen","umfang","rahmen","software","update","abschalteinrichtung",
+  "bereich","liege","volkswagen","audi","porsche","hinsichtlich","davon","gmbh","sogenannten","gehabt",
+  "höheren","bzw","typgenehmigungen","weitere","übrigen","realen"
+)
+```
+
+```{r}
+data_prepared = data %>%
+  mutate(tatbestand_bereingt = textverarbeitung(tatbestand, manuelle_stoppwörter)) %>%
+  select(-tatbestand, -tatbestand_raw)
+```
+
+
+# Cross-Validation: LDA pro Fold und GBM-Klassifikation
+
+Die Validierung erfolgt mit 10-Fold-Cross-Validation. Wichtig dabei ist, dass alle textbasierten Schritte pro Fold ausschließlich auf dem Trainingsanteil passieren, damit keine Information aus dem Validierungsfold in das Topic Modelling einfließt.
+
+Pro Fold werden Unigrams und Bigrams erzeugt, anschließend eine Dokument-Term-Matrix erstellt und Tokens entfernt, die entweder in fast allen Dokumenten vorkommen oder extrem selten sind. Danach wird ein LDA-Modell trainiert. Aus dem Modell werden die Topic-Anteile je Dokument extrahiert. Für die Validierungsdokumente werden Topic-Anteile über die posterior-Funktion berechnet, wobei das Vokabular auf die Trainings-DTM beschränkt bleibt.
+
+Diese Topic-Anteile werden mit den Hardfacts und technischen Dummy-Variablen kombiniert und in einem Gradient Boosting Modell klassifiziert. Statt direkt Klassen vorherzusagen, werden Wahrscheinlichkeiten genutzt und ein Threshold gesetzt, um den Tradeoff zwischen Sensitivity und Precision gezielt zu steuern. Am Ende werden pro Fold Sensitivity, Precision und F1 berechnet und über alle Folds gemittelt.
+
+```{r}
+set.seed(123)
+folds = createFolds(data_prepared$erfolg, k = 10)
+gbm_grid = expand.grid(interaction.depth = 3, n.trees = 100, shrinkage = 0.1, n.minobsinnode = 10)
+
+cv_results = lapply(seq_along(folds), function(i) {
+  cat("Fold:", i, "\n")
+  valid_idx = folds[[i]]
+  train_idx = setdiff(seq_len(nrow(data_prepared)), valid_idx)
+
+  train_raw = data_prepared[train_idx, ]
+  valid_raw = data_prepared[valid_idx, ]
+
+  train_tokens = train_raw %>% unnest_tokens(tokens, tatbestand_bereingt)
+  train_tokens_bi = train_raw %>% unnest_tokens(tokens, tatbestand_bereingt, token = "ngrams", n = 2)
+  train_wc = bind_rows(train_tokens, train_tokens_bi) %>% count(dateiname, tokens)
+
+  keep_tokens = train_wc %>%
+    group_by(tokens) %>%
+    summarize(p = n()/nrow(train_raw)) %>%
+    filter(p <= 0.90 & p >= 0.01) %>%
+    pull(tokens)
+
+  dtm_train = train_wc %>%
+    filter(tokens %in% keep_tokens) %>%
+    cast_dtm(document = dateiname, term = tokens, value = n)
+
+  lda_fold = LDA(dtm_train, k = 7, method = "Gibbs", control = list(seed = 1234, iter = 1000))
+
+  gamma_train = tidy(lda_fold, matrix = "gamma") %>%
+    pivot_wider(names_from = topic, values_from = gamma, names_prefix = "thema_") %>%
+    rename(dateiname = document)
+
+  valid_wc = valid_raw %>%
+    unnest_tokens(tokens, tatbestand_bereingt) %>%
+    count(dateiname, tokens) %>%
+    filter(tokens %in% colnames(dtm_train))
+
+  dtm_valid = valid_wc %>%
+    cast_dtm(document = dateiname, term = tokens, value = n)
+
+  gamma_valid_mat = posterior(lda_fold, dtm_valid)$topics %>% as.data.frame()
+  colnames(gamma_valid_mat) <- paste0("thema_", 1:7)
+  gamma_valid = gamma_valid_mat %>% mutate(dateiname = rownames(.))
+
+  train_ml = train_raw %>%
+    inner_join(gamma_train, by = "dateiname") %>%
+    mutate(erfolg = factor(erfolg, levels = c("Ja", "Nein")))
+
+  valid_ml = valid_raw %>%
+    inner_join(gamma_valid, by = "dateiname") %>%
+    mutate(erfolg = factor(erfolg, levels = c("Ja", "Nein")))
+
+  gbm_fold = train(
+    erfolg ~ .,
+    data = train_ml %>% select(erfolg, starts_with("has_"), starts_with("thema_"), motortyp, hubraum, zustand),
+    method = "gbm",
+    trControl = trainControl(method = "none", sampling = "down"),
+    tuneGrid = gbm_grid,
+    verbose = FALSE
+  )
+
+  probs <- predict(gbm_fold, valid_ml, type = "prob")
+
+  threshold = 0.4
+  pred = ifelse(probs$Ja > threshold, "Ja", "Nein")
+  pred = factor(pred, levels = c("Ja", "Nein"))
+
+  cm = confusionMatrix(pred, valid_ml$erfolg, positive = "Ja")
+  cm$byClass[c("Sensitivity", "Precision", "F1")]
+})
+
+cv_summary = do.call(rbind, cv_results)
+colMeans(cv_summary, na.rm = TRUE)
+```
+
+
+# Finales Topic Modell auf allen Trainingsdaten und Export der Features
+
+Nach der Validierung wird das Topic Modell final auf dem gesamten Trainingsdatensatz trainiert. Vorgehen und Token-Filterung entsprechen dem Fold-Setup, allerdings mit mehr Iterationen, um stabilere Themen zu erhalten. Die Topic-Anteile pro Dokument werden anschließend als Features an den Datensatz angefügt und als CSV exportiert, damit die Feature-Tabelle transparent nachvollziehbar bleibt und bei Bedarf extern geprüft werden kann.
+
+```{r}
+all_tokens <- data_prepared %>% unnest_tokens(tokens, tatbestand_bereingt)
+all_tokens_bi <- data_prepared %>% unnest_tokens(tokens, tatbestand_bereingt, token = "ngrams", n = 2)
+word_counts <- bind_rows(all_tokens, all_tokens_bi) %>% count(dateiname, tokens)
+
+ausreisser <- word_counts %>%
+  group_by(tokens) %>%
+  summarize(p = n()/nrow(data_prepared)) %>%
+  filter(p > 0.90 | p < 0.01) %>%
+  pull(tokens)
+
+dtm_final <- word_counts %>%
+  filter(!(tokens %in% ausreisser)) %>%
+  cast_dtm(document = dateiname, term = tokens, value = n)
+
+lda_model_final <- LDA(dtm_final, k = 7, method = "Gibbs", control = list(seed = 1234, iter = 1500))
+
+ml_gamma_final <- tidy(lda_model_final, matrix = "gamma") %>%
+  pivot_wider(names_from = topic, values_from = gamma, names_prefix = "thema_") %>%
+  rename(dateiname = document)
+
+training_final_lda <- data_prepared %>% inner_join(ml_gamma_final, by = "dateiname")
+
+write.csv(training_final_lda, "tabelle_training_lda.csv", row.names = FALSE)
+```
+
+
+# Themeninterpretation und Visualisierung
+
+Um die erkannten Topics inhaltlich zu interpretieren, werden pro Topic die Top-Begriffe anhand der Beta-Wahrscheinlichkeit extrahiert. Eine Zuordnungstabelle vergibt sprechende Namen, damit die Ergebnisse leichter diskutierbar sind. Die Visualisierungen dienen vor allem der qualitativen Plausibilisierung. Welche Begriffe dominieren ein Topic, und unterscheiden sich die Themen tatsächlich voneinander.
+
+```{r}
+themen_namen_map <- c(
+  "1" = "Europarecht & Grenzwerte",
+  "2" = "Gewährleistung & Täuschung",
+  "3" = "Rückabwicklung & Nutzung",
+  "4" = "Prozessuale Formalia",
+  "5" = "Vorstandschaft & Strategie",
+  "6" = "Emissionen & Prüfstand",
+  "7" = "Techn. Abschalteinrichtung"
+)
+
+top_terms <- tidy(lda_model_final, matrix = "beta") %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 5) %>%
+  ungroup() %>%
+  mutate(
+    topic_name = themen_namen_map[as.character(topic)],
+    term = reorder_within(term, beta, topic)
+  )
+
+ggplot(top_terms, aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic_name, scales = "free_y") +
+  scale_y_reordered() +
+  scale_fill_viridis_d(option = "mako", begin = 0.3) +
+  labs(
+    title = "Top 5 Begriffe pro identifiziertem Rechtsbereich",
+    subtitle = "Basierend auf den Beta-Wahrscheinlichkeiten des LDA-Modells",
+    x = "Wahrscheinlichkeit (Beta)",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(strip.text = element_text(face = "bold", size = 10))
+
+top_terms_wide <- tidy(lda_model_final, matrix = "beta") %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 7) %>%
+  ungroup() %>%
+  mutate(topic_name = themen_namen_map[as.character(topic)])
+
+ggplot(top_terms_wide, aes(x = factor(topic_name), y = term, fill = beta)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "#2c3e50") +
+  labs(
+    title = "Themen-Begriffs-Matrix",
+    x = "Rechtsbereich / Thema",
+    y = "Begriff",
+    fill = "Beta"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+top_terms_refined <- tidy(lda_model_final, matrix = "beta") %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 7) %>%
+  ungroup() %>%
+  mutate(
+    topic_name = themen_namen_map[as.character(topic)],
+    term = reorder_within(term, beta, topic)
+  )
+
+ggplot(top_terms_refined, aes(beta, term, color = factor(topic))) +
+  geom_segment(aes(x = 0, xend = beta, y = term, yend = term), color = "grey80") +
+  geom_point(size = 3, show.legend = FALSE) +
+  facet_wrap(~ topic_name, scales = "free_y") +
+  scale_y_reordered() +
+  scale_color_viridis_d(option = "viridis") +
+  labs(
+    title = "Juristische Inhaltsanalyse (LDA)",
+    subtitle = "Top-Begriffe nach ihrer Relevanz (Beta) für das jeweilige Thema",
+    x = "Wahrscheinlichkeit des Begriffs im Thema",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(panel.grid.major.y = element_blank())
+```
+
+
+# Rauschenprüfung
+
+Ein zusätzlicher Check ist die Frage, ob einzelne Begriffe in sehr vielen Topics gleichzeitig prominent sind. Solche Wörter sind oft zu allgemein und können die Trennschärfe zwischen Topics reduzieren. Dafür werden größere Top-Listen pro Topic gezogen und gezählt, welche Begriffe mehrfach auftauchen. Ergänzend wird geprüft, in wie vielen Topics ein Begriff oberhalb eines kleinen Beta-Schwellenwerts liegt.
+
+```{r}
+top_terms_all <- tidy(lda_model_final, matrix = "beta") %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 50) %>%
+  ungroup()
+
+word_topic_freq <- top_terms_all %>%
+  count(term) %>%
+  filter(n >= 2) %>%
+  arrange(desc(n))
+
+print(word_topic_freq)
+
+rauschen_check <- tidy(lda_model_final, matrix = "beta") %>%
+  group_by(term) %>%
+  summarize(
+    avg_beta = mean(beta),
+    anzahl_themen = n_distinct(topic[beta > 0.001])
+  ) %>%
+  filter(anzahl_themen > 3) %>%
+  arrange(desc(avg_beta))
+
+head(rauschen_check, 20)
+```
+
+
+# Artefakte speichern für Reproduzierbarkeit und spätere Anwendung
+
+Damit das Modell später wiederverwendet werden kann, werden alle zentralen Bausteine gespeichert. Das finale Vokabular, das trainierte LDA-Modell, die Topic-Namen sowie die manuelle Stopwortliste. Dadurch ist die identische Vorverarbeitung und Projektion auf Topics auch für neue Fälle möglich.
+
+```{r}
+trainings_vokabular <- colnames(dtm_final)
+saveRDS(trainings_vokabular, "trainings_vokabular.rds")
+saveRDS(lda_model_final, "lda_modell_final.rds")
+write.csv(training_final_lda, "tabelle_training_lda.csv", row.names = FALSE)
+themen_namen <- paste0("thema_", 1:7)
+saveRDS(themen_namen, "themen_namen.rds")
+saveRDS(manuelle_stoppwörter, "manuelle_stoppwörter.rds")
+```
+
+
+# Finales Klassifikationsmodell und Variable Importance
+
+Zum Abschluss wird ein finales Gradient Boosting Modell auf allen Trainingsdaten trainiert. Als Eingabe dienen die Hardfacts, die Topic-Anteile sowie die technischen Dummy-Variablen. Die Variable Importance unterstützt die Interpretation. Sie zeigt, welche Merkmale das Modell besonders stark für die Vorhersage nutzt. Zur besseren Lesbarkeit werden die Variablennamen in sprechende Beschreibungen übersetzt und anschließend als Balkendiagramm dargestellt.
+
+```{r}
+train_ml_final <- training_final_lda %>%
+  mutate(erfolg = factor(erfolg, levels = c("Ja", "Nein"))) %>%
+  select(erfolg, starts_with("has_"), starts_with("thema_"), motortyp, hubraum, zustand)
+
+final_grid <- expand.grid(
+  interaction.depth = 3,
+  n.trees = 100,
+  shrinkage = 0.1,
+  n.minobsinnode = 10
+)
+
+gbm_final_model <- train(
+  erfolg ~ .,
+  data = train_ml_final,
+  method = "gbm",
+  trControl = trainControl(method = "none", sampling = "down"),
+  tuneGrid = final_grid,
+  verbose = FALSE
+)
+
+importance <- caret::varImp(gbm_final_model, scale = TRUE)
+importance_df <- importance$importance %>%
+  rownames_to_column(var = "Merkmal")
+
+importance_df <- importance_df %>%
+  mutate(Merkmal = recode(Merkmal,
+    "thema_1" = "Thema 1: Europarechtliche Normen & Grenzwerte",
+    "thema_2" = "Thema 2: Gewährleistungsrecht & Täuschung",
+    "thema_3" = "Thema 3: Rückabwicklung & Nutzungsersatz",
+    "thema_4" = "Thema 4: Prozessuale Identifikation & Formalia",
+    "thema_5" = "Thema 5: Strategische Entwicklung & Vorstandshaftung",
+    "thema_6" = "Thema 6: Abgaswerte & Prüfstandsmessungen",
+    "thema_7" = "Thema 7: Technische Abschalteinrichtungen",
+    "has_sittenwidrig" = "Merkmal: Sittenwidrigkeit",
+    "has_update" = "Merkmal: Software-Update",
+    "has_verjaehrung" = "Merkmal: Verjährung",
+    "has_ruecktritt" = "Merkmal: Rücktritt",
+    "motortyp" = "Technik: Motortyp EA189",
+    "hubraum" = "Technik: Hubraum 2.0L",
+    "zustand" = "Technik: Neuwagen"
+  )) %>%
+  filter(Overall > 0) %>%
+  arrange(desc(Overall))
+
+ggplot(importance_df, aes(x = reorder(Merkmal, Overall), y = Overall)) +
+  geom_bar(stat = "identity", fill = "#34495e") +
+  coord_flip() +
+  labs(
+    title = "Einflussfaktoren auf den Prozesserfolg",
+    subtitle = "Gezeigt werden nur Merkmale mit messbarem Einfluss auf die Vorhersage",
+    x = NULL,
+    y = "Relative Wichtigkeit (0-100)"
+  ) +
+  theme_minimal()
+```
+
