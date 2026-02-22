@@ -14,15 +14,15 @@ library(tidytext)
 library(slam)
 
 # Import der vortrainierten Modelle und Validierungsparameter
-final_gbm    <- readRDS("gbm_modell_final.rds")      
-final_rf_reg <- readRDS("rf_regr_modell_final.rds")   
-lda_model    <- readRDS("lda_modell_final.rds")
-vokabular    <- readRDS("trainings_vokabular.rds")
-best_t       <- readRDS("optimaler_threshold.rds")   
-manuelle_stoppwoerter <- readRDS("manuelle_stoppworte.rds")
+final_gbm    = readRDS("gbm_modell_final.rds")      
+final_rf_reg = readRDS("rf_regr_modell_final.rds")   
+lda_model    = readRDS("lda_modell_final.rds")
+vokabular    = readRDS("trainings_vokabular.rds")
+best_t       = readRDS("optimaler_threshold.rds")   
+manuelle_stoppwoerter = readRDS("manuelle_stoppworte.rds")
 
 # Definition der Themennamen für das Dashboard
-themen_namen <- c(
+themen_namen = c(
   "Europarecht & Grenzwerte",
   "Gewährleistung & Täuschung",
   "Rückabwicklung & Nutzung",
@@ -34,7 +34,7 @@ themen_namen <- c(
 
 source("utils.R") 
 # Gestaltung des Headers mit Logo 
-ui <- page_navbar(
+ui = page_navbar(
   title = div(
     style = "display: flex; align-items: center;",
     tags$img(src = "logo.png", height = "100px", style = "margin-right: 20px;"), 
@@ -122,7 +122,7 @@ ui <- page_navbar(
   )
 ) 
 
-server <- function(input, output, session) {
+server = function(input, output, session) {
   
   observeEvent(input$submit, {
     set.seed(123) 
@@ -133,24 +133,24 @@ server <- function(input, output, session) {
     }
     
 # Textverarbeitung
-    clean_text <- textverarbeitung(input$tatbestand_text, manuelle_stoppwoerter)
+    clean_text = textverarbeitung(input$tatbestand_text, manuelle_stoppwoerter)
     
-    tokens_uni <- tibble(word = unlist(strsplit(clean_text, " ")))
-    tokens_bi  <- tibble(text = clean_text) %>% unnest_tokens(word, text, token = "ngrams", n = 2)
-    tokens_all <- bind_rows(tokens_uni, tokens_bi) %>% filter(word %in% vokabular)
+    tokens_uni = tibble(word = unlist(strsplit(clean_text, " ")))
+    tokens_bi  = tibble(text = clean_text) %>% unnest_tokens(word, text, token = "ngrams", n = 2)
+    tokens_all = bind_rows(tokens_uni, tokens_bi) %>% filter(word %in% vokabular)
     
-    counts <- tokens_all %>% count(word)
-    dtm_mat <- matrix(0, nrow = 1, ncol = length(vokabular), dimnames = list("doc", vokabular))
-    if(nrow(counts) > 0) dtm_mat[1, counts$word] <- counts$n
-    test_dtm_ready <- as.simple_triplet_matrix(dtm_mat)
+    counts = tokens_all %>% count(word)
+    dtm_mat = matrix(0, nrow = 1, ncol = length(vokabular), dimnames = list("doc", vokabular))
+    if(nrow(counts) > 0) dtm_mat[1, counts$word] = counts$n
+    test_dtm_ready = as.simple_triplet_matrix(dtm_mat)
     
 # Topic Modeling: Berechnung der Themenwahrscheinlichkeiten
-    topic_probs <- posterior(lda_model, test_dtm_ready)$topics %>% as.data.frame()
-    colnames(topic_probs) <- paste0("thema_", 1:7)
+    topic_probs = posterior(lda_model, test_dtm_ready)$topics %>% as.data.frame()
+    colnames(topic_probs) = paste0("thema_", 1:7)
     
 # Extraktion rechtlicher Risikofaktoren (Flags)
-    raw_txt <- tolower(input$tatbestand_text)
-    legal_flags <- data.frame(
+    raw_txt = tolower(input$tatbestand_text)
+    legal_flags = data.frame(
       has_verjaehrung  = as.integer(str_detect(raw_txt, "verjähr")),
       has_ruecktritt   = as.integer(str_detect(raw_txt, "rücktritt")),
       has_sittenwidrig = as.integer(str_detect(raw_txt, "sittenwidrig")),
@@ -173,7 +173,7 @@ server <- function(input, output, session) {
     prob_ja <- predict(final_gbm, newdata = input_gbm, type = "prob")$Ja
     
 # Durchführung der Random-Forest-Regression
-    input_regr <- data.frame(
+    input_regr = data.frame(
       kaufpreis_euro = input$kaufpreis_input,
       km_stand_kauf  = input$km_input,
       motortyp       = as.numeric(input$motortyp),
@@ -181,23 +181,23 @@ server <- function(input, output, session) {
       has_update     = legal_flags$has_update
     ) %>% bind_cols(topic_probs)
     
-    euro_prognose <- predict(final_rf_reg, newdata = input_regr)
+    euro_prognose = predict(final_rf_reg, newdata = input_regr)
     
-    prob_val <- prob_ja * 100
+    prob_val = prob_ja * 100
     
 # Ausgabe des Ergebnisses, je nach Wahrscheinlichkeit
     if (prob_val > 60) {
-      aktuelle_farbe <- "success" 
-      box_titel      <- "Vorauss. Schadensersatz"
-      box_wert       <- paste0(format(round(euro_prognose, 2), big.mark="."), " €")
+      aktuelle_farbe = "success" 
+      box_titel      = "Vorauss. Schadensersatz"
+      box_wert       = paste0(format(round(euro_prognose, 2), big.mark="."), " €")
     } else {
-      aktuelle_farbe <- "secondary" 
-      box_titel      <- "Voraussichtlich kein Anspruch"
-      box_wert       <- "0 €"
+      aktuelle_farbe = "secondary" 
+      box_titel      = "Voraussichtlich kein Anspruch"
+      box_wert       = "0 €"
     }
     
     
-    output$tendenz_text <- renderUI({ 
+    output$tendenz_text = renderUI({ 
       if(prob_val > 80) {
         span("Hochgradig Erfolgversprechend", style = "font-size: 18px; font-weight: bold; color: #28a745;")
       } else if(prob_val > 60) {
@@ -207,11 +207,11 @@ server <- function(input, output, session) {
       }
     })
     
-    output$euro_box <- renderUI({
+    output$euro_box = renderUI({
       value_box(title = box_titel, value = box_wert, showcase = bs_icon("currency-euro"), theme = aktuelle_farbe)
     })
     
-    output$gauge_plot <- renderPlotly({
+    output$gauge_plot = renderPlotly({
       plot_ly(type = "indicator", mode = "gauge+number", value = prob_val,
               gauge = list(axis = list(range = list(0, 100)),
                            bar = list(color = "#2c3e50"),
@@ -219,9 +219,9 @@ server <- function(input, output, session) {
                                         list(range = c(50, 100), color = "#d4edda"))))
     })
     
-    output$risk_analysis <- renderUI({
+    output$risk_analysis = renderUI({
      # Den Namen des dominanten Themas aus der Liste ziehen
-      idx <- which.max(topic_probs)
+      idx = which.max(topic_probs)
       tags$ul(
         tags$li(strong("Sittenwidrigkeit:"), if(legal_flags$has_sittenwidrig == 1) "Marker detektiert" else "Keine Hinweise"),
         tags$li(strong("Verjährung:"), if(legal_flags$has_verjaehrung == 1) span("Risiko erkannt", style="color:red;") else "Unkritisch"),
