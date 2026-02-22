@@ -13,7 +13,7 @@ Zu Beginn werden die globalen Knit-Optionen gesetzt, damit der Code in der Abgab
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 
-setwd("C:/Users/timfe/OneDrive/Dokumente/5. Studium/Master Ulm/Data Science & Law")
+setwd("Working Directory")
 ```
 
 
@@ -129,7 +129,7 @@ textverarbeitung = function(text, custom_stopwords) {
 ```
 
 ```{r}
-manuelle_stoppwörter <- c(
+manuelle_stoppworte <- c(
   "festgestellt", "feststellen", "ergibt", "ergeben", "resultiert",
   "beruht", "aufgrund", "insoweit", "insgesamt", "jedenfalls",
   "vorliegend", "vorliegende", "streitig", "unstreitig",
@@ -183,7 +183,7 @@ manuelle_stoppwörter <- c(
 
 ```{r}
 data_prepared = data %>%
-  mutate(tatbestand_bereingt = textverarbeitung(tatbestand, manuelle_stoppwörter)) %>%
+  mutate(tatbestand_bereingt = textverarbeitung(tatbestand, manuelle_stoppworte)) %>%
   select(-tatbestand, -tatbestand_raw)
 ```
 
@@ -427,7 +427,7 @@ saveRDS(lda_model_final, "lda_modell_final.rds")
 write.csv(training_final_lda, "tabelle_training_lda.csv", row.names = FALSE)
 themen_namen <- paste0("thema_", 1:7)
 saveRDS(themen_namen, "themen_namen.rds")
-saveRDS(manuelle_stoppwörter, "manuelle_stoppwörter.rds")
+saveRDS(manuelle_stoppworte, "manuelle_stoppworte.rds")
 ```
 
 
