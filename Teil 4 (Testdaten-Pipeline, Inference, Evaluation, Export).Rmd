@@ -39,7 +39,7 @@ themen_namen <- readRDS("themen_namen.rds")
 final_gbm <- readRDS("gbm_modell_final.rds")
 final_rf_reg <- readRDS("rf_regr_modell_final.rds")
 best_t <- readRDS("optimaler_threshold.rds")
-manuelle_stoppwörter <- readRDS("manuelle_stoppwörter.rds")
+manuelle_stoppworte <- readRDS("manuelle_stoppworte.rds")
 ```
 
 
